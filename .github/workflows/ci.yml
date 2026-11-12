@@ -1,0 +1,74 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    name: Build win_zero_cli + verify (windows-latest)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Toolchain
+        run: |
+          clang --version
+          python --version
+
+      - name: Build (strict warnings, no C runtime, KERNEL32 only)
+        run: |
+          $out = clang -std=c11 -O2 -Wall -Wextra -pedantic -Werror -ffreestanding -nostdlib -fuse-ld=lld `
+            "-Wl,/entry:wz_main" "-Wl,/subsystem:console" src/main.c -lkernel32 -o win_zero_cli.exe 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { Write-Host $out; throw "build failed" }
+          if ($out.Trim()) { Write-Host $out; throw "compiler printed diagnostics; 0 warnings required" }
+          $size = (Get-Item win_zero_cli.exe).Length
+          $hash = (Get-FileHash win_zero_cli.exe -Algorithm SHA256).Hash.ToLower()
+          "size=$size bytes, sha256=$hash"
+          "## win_zero_cli.exe`n- size: $size bytes`n- SHA-256: ``$hash``" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Imports (dumpbin + llvm-objdump)
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe | Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
+          $deps = & $dumpbin.FullName /nologo /dependents win_zero_cli.exe | Out-String
+          Write-Host $deps
+          $dlls = [regex]::Matches($deps, '(?im)^\s+(\S+\.dll)\s*$') | ForEach-Object { $_.Groups[1].Value.ToUpper() }
+          if (($dlls -join ',') -ne 'KERNEL32.DLL') { throw "unexpected DLL dependencies: $($dlls -join ', ')" }
+          llvm-objdump -p win_zero_cli.exe | Select-String 'DLL Name'
+          "- dumpbin /dependents: ``$($dlls -join ', ')``" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Run (exit codes, UTF-8 output, self-test)
+        run: |
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $greet = & .\win_zero_cli.exe | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "greeting exit $LASTEXITCODE" }
+          $self = & .\win_zero_cli.exe --selftest | Out-String
+          if ($LASTEXITCODE -ne 0) { Write-Host $self; throw "self-test exit $LASTEXITCODE" }
+          Write-Host $greet
+          Write-Host $self
+          "`n``````text`n$greet$self``````" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Unit tests
+        env:
+          PYTHONUTF8: '1'
+        run: python -m unittest -v tests.test_win_zero_cli
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win_zero_cli
+          path: win_zero_cli.exe
+          if-no-files-found: error
