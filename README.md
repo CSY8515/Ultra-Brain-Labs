@@ -1,139 +1,209 @@
 # Ultra-Brain-Labs
 
-Ultra-Brain에서 나온 실전 엔지니어링 결과물을 공개하는 저장소입니다. 첫 번째 결과물은 Windows용 무의존성 CLI 가이드와, 그 가이드대로 만든 레퍼런스 구현입니다.
+[![Windows CI](https://github.com/CSY8515/Ultra-Brain-Labs/actions/workflows/ci.yml/badge.svg)](https://github.com/CSY8515/Ultra-Brain-Labs/actions/workflows/ci.yml)
 
-- **가이드**: Windows CLI·봇 개발 "덜그덕거림 0%" 엔지니어링 (아래)
-- **레퍼런스 구현**: [`src/main.c`](src/main.c) → `win_zero_cli.exe`
-  - C11 파일 하나, C 런타임 없음, import는 `KERNEL32.dll` 하나뿐
-  - 한글 UTF-8 출력, 정적 아레나 메모리, 자체 시험
-- **검증**: [Windows CI](.github/workflows/ci.yml) — 엄격 빌드 경고 0, `dumpbin`·`llvm-objdump`·자체 PE 파서로 의존 DLL 검사, 실행 시험, 단위 테스트
+Ultra-Brain 개발에서 나온 Windows 시스템 엔지니어링 결과물을 공개하는 저장소입니다. 두 도구 모두 **C11 파일 하나, C 런타임 없음, 임포트 DLL은 `KERNEL32.dll` 하나**입니다. 이 문서의 모든 수치는 출처(CI run 번호 또는 로컬 측정 조건)를 함께 적었고, 측정하지 않은 값은 적지 않았습니다.
+
+| 파일 | 역할 |
+|---|---|
+| [`src/win_zero_cli.c`](src/win_zero_cli.c) | Part 1 — 무의존성 CLI 레퍼런스 (`win_zero_cli.exe`, 5,120 B) |
+| [`src/agent_wire_ipc.c`](src/agent_wire_ipc.c) | Part 2 — Win32 named pipe 기반 로컬 에이전트 IPC (`agent_wire_ipc.exe`) |
+| [`build.cmd`](build.cmd) | `build.cmd`(clang+lld) / `build.cmd msvc` — 둘 다 경고를 오류로 처리 |
+| [`scripts/wire_scenario.ps1`](scripts/wire_scenario.ps1) | 서버 1 + 클라이언트 1회 + 벤치 1,000회 왕복 시나리오, 출력 원문 저장 |
+| [`tests/`](tests/) | Python 표준 라이브러리만으로 PE import 표 검사, 파이프 프로토콜 구동, 종료 코드 검사 |
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | clang job + MSVC job (아래 §1) |
+| [`CHANGELOG.md`](CHANGELOG.md) · [`VERSION`](VERSION) | 변경 이력, 현재 1.1.0 |
+
+```bat
+build.cmd
+```
 
 ---
 
-# Windows CLI·봇 개발 '덜그덕거림 0%' 엔지니어링 가이드
-> AI(Claude, ChatGPT, Cursor) 프롬프트 및 시스템 엔지니어링 정본
+## 1. Windows CI 배지가 보증하는 물리적 인증의 실체
 
-> **검증 노트**는 이 저장소를 만들며 실제로 확인한 내용입니다. 가이드 원문과 다른 점이 있을 때만 덧붙였습니다.
+배지 뒤에서 실제로 일어나는 일은 [`ci.yml`](.github/workflows/ci.yml) 한 파일에 전부 적혀 있습니다. 두 job이 **GitHub-hosted `windows-latest` 러너**(GitHub가 Microsoft Azure에 띄우는 순정 Windows 가상머신, 이 저장소 소유자가 손댈 수 없는 환경)에서 매 push·tag·PR마다 돕니다.
 
-## 1. 윈도우에서 CLI/봇이 덜그덕거리는 3대 근본 원인
-많은 개발자와 AI가 윈도우에서 도구를 만들 때 "계속 뭐 설치해달라", "인코딩이 깨진다", "실행이 안 된다"며 포기하는 이유는 윈도우 자체의 문제가 아니라 **설계 방식의 불일치** 때문입니다:
+| 단계 | clang job | MSVC job | 실패 조건 |
+|---|---|---|---|
+| 빌드 | `clang -std=c11 -O2 -Wall -Wextra -pedantic -Werror -ffreestanding -nostdlib -fuse-ld=lld … -lkernel32` | `cl /std:c11 /O2 /W4 /WX /utf-8 /GS- … /link /SUBSYSTEM:CONSOLE /NODEFAULTLIB kernel32.lib` | 컴파일러가 **한 줄이라도** 출력하면 실패 (경고 0 강제) |
+| 임포트 | `dumpbin /dependents` + `llvm-readobj --coff-imports` | `dumpbin /dependents` + `dumpbin /imports` | 의존 DLL 목록이 정확히 `KERNEL32.dll` 하나가 아니면 실패 |
+| 자체 시험 | `win_zero_cli --selftest`(4) · `agent_wire_ipc --selftest`(11) | 동일 | 종료 코드 ≠ 0 |
+| 파이프 시나리오 | 서버 1 프로세스, `--client`, `--bench 1000` | 동일 | 영수증 1,000/1,000 미달, 서버 종료 코드 ≠ 0 |
+| 단위 테스트 | Python 3.13 표준 라이브러리 12건 (PE 파서, 파이프 구동) | — | 1건이라도 실패 |
+| 산출물 | 두 exe + 벤치 원문 `bench_clang.txt` | 두 exe + `bench_msvc.txt` | 파일 없으면 실패 |
 
-1. **외부 의존성 지옥 (Dependency Hell)**:
-   - 대부분의 CLI 오픈소스는 리눅스/맥(POSIX) 기준이라, 윈도우에 오면 `MSVC C++ Build Tools (수 GB)`, `Visual C++ Redistributable (DLL 누락)`, 파이썬 가상환경 충돌을 일으킵니다.
-2. **콘솔 인코딩 및 환경 마찰**:
-   - 윈도우 기본 콘솔(CP949)과 현대 UTF-8의 충돌, 줄바꿈(CRLF vs LF) 불일치로 인한 파싱 에러가 발생합니다.
-3. **윈도우 보안 방파제 (Smart App Control & Mark-of-the-Web)**:
-   - 외부에서 다운로드받은 미인증 `.exe`는 Windows Defender 및 SAC가 "알 수 없는 게시자"로 간주하여 차단하거나 실행을 지연시킵니다.
+이번 릴리즈의 증거 run: **[43373628526](https://github.com/CSY8515/Ultra-Brain-Labs/actions/runs/43373628526)** (커밋 `c6e88ed`, 브랜치 `rc/v1.1.0`, 소스는 `v1.1.0`과 바이트 동일). 그 run에서 확인된 사실:
 
-## 2. 덜그덕거림 원천 차단: 3대 시스템 엔지니어링 원칙
+- 컴파일러: clang **20.1.8** (러너 기본) / MSVC **19.51.36260**. 로컬 개발기는 clang 19.1.5 + MSVC 14.44로 같은 명령이 경고 0으로 통과했습니다.
+- 두 도구 × 두 컴파일러 = 4개 바이너리 모두 의존 DLL `KERNEL32.dll` 1개. `agent_wire_ipc.exe`가 쓰는 함수 16개 전부 로그에 열거됨.
+- 모든 자체 시험·시나리오·단위 테스트 종료 코드 0.
 
-### 원칙 1: 외부 의존성 제로 (Zero-Dependency Architecture)
-- **핵심**: 사용자의 PC에 Python, Node.js, C++ 빌드 툴이 없어도 100% 돌아가야 합니다.
-- **해결책**:
-  - 외부 런타임에 의존하지 않는 단일 C11 바이너리로 컴파일.
-  - 외부 DLL을 일체 임포트하지 않고, 윈도우 95 시절부터 모든 Windows에 100% 내장된 **`KERNEL32.dll` (또는 순정 Win32 API)**만 단독 임포트하도록 링크.
-  - 결과: 별도 설치 요청("뭐 설치해주세요")이 영구히 0건이 됨.
+배지가 **증명하지 않는 것**도 분명히 적습니다. (1) 바이너리는 서명되지 않았습니다. Smart App Control이 켜진 PC는 CI가 만든 exe도, 로컬에서 직접 빌드한 exe도 차단할 수 있습니다(개발기에서 실제로 `An Application Control policy has blocked this file`로 막혀 로컬 실행은 NOT_RUN). (2) 러너는 x64 Windows Server 한 종류입니다. ARM64·구형 Windows·회사 정책(AppLocker/WDAC)은 따로 확인해야 합니다. (3) `KERNEL32.dll`만 임포트해도 함수별 최소 Windows 버전은 다릅니다. 두 도구가 쓰는 `K32GetProcessMemoryInfo`는 Windows 7 이상입니다.
 
-> **검증 노트**
-> - `KERNEL32.dll` 자체는 모든 Windows에 있지만, **함수마다 최소 Windows 버전이 다릅니다.** 예를 들어 이 구현이 쓰는 `K32GetProcessMemoryInfo`는 Windows 7 이상에만 있습니다. 쓰는 API의 최소 버전을 함께 확인하세요.
-> - 일반적인 `clang`/`cl` 빌드는 C 런타임(`ucrtbase.dll`, `vcruntime140.dll` 등)을 끌어옵니다. KERNEL32만 남기려면 C 런타임 없이 빌드하거나(이 저장소의 방식: `-ffreestanding -nostdlib`, 진입점 직접 지정) 정적 런타임(`/MT`)으로 링크해야 합니다. 결과는 `dumpbin /dependents`로 확인합니다.
+---
 
-### 원칙 2: 보안 차단(SAC) 없는 로컬 빌드 및 소스 러너
-- **핵심**: 웹에서 다운로드된 파일에 붙는 차단 마크(`Zone.Identifier`)를 회피합니다.
-- **해결책**:
-  - 인터넷에서 빌드된 exe를 받지 않고, 로컬 환경에서 Clang/TCC 또는 가벼운 러너 스크립트를 통해 온디바이스로 직접 구워냅니다.
-  - 파이썬 환경을 쓸 경우에도 무거운 패키징 exe 대신 소스 직접 실행(`pythonw -B -m ...`) 방식을 사용하여 SAC 오탐을 원천 회피합니다.
+## 2. Windows 환경 길막 분쇄 원리와 도구 (`win_zero_cli.c`)
 
-> **검증 노트 — 로컬 빌드도 SAC에 막힐 수 있습니다.**
-> - 로컬에서 만든 파일에는 `Zone.Identifier` 표시가 붙지 않는 것이 맞습니다.
-> - 하지만 Smart App Control은 그 표시와 별개로 **서명되지 않은 실행 파일을 평판으로 판정**합니다. Ultra-Brain 개발 중, Smart App Control이 켜진 PC에서 로컬로 빌드한 서명 없는 C 바이너리가 실제로 차단됐습니다(`WinError 4551`, 애플리케이션 제어 정책). 같은 PC에서 다른 빌드는 실행되기도 했습니다. 즉 결과를 미리 보장할 수 없습니다.
-> - 확실한 방법은 **신뢰된 게시자 서명(code signing)**입니다. 서명 전까지는 검증을 CI(예: GitHub Actions의 Windows 러너)나 SAC가 꺼진 환경에서 하세요.
-> - 보안 설정을 끄거나 우회하는 것은 해결책이 아닙니다.
-> - `pythonw -B -m ...` 소스 실행은 서명된 `python.exe`가 실행되는 것이라, 별도 exe를 만들 때보다 차단될 일이 적습니다.
+### 해결하는 문제
+Windows에서 CLI·봇을 만들 때 멈추는 지점은 네 가지로 좁혀집니다. **파이썬 가상환경 충돌**(인터프리터·패키지 버전 불일치), **DLL 누락**(`vcruntime140.dll`, `msvcp140.dll`, `ucrtbase.dll` 요구), **Smart App Control 오탐**(서명 없는 exe 차단), **안티바이러스 오인 차단**(패커로 만든 단일 exe가 휴리스틱에 걸림). 원인은 Windows가 아니라 설계입니다. 런타임을 들고 다니지 않고, 모든 Windows에 이미 있는 DLL 하나만 쓰고, 바이너리를 내려받는 대신 소스를 그 자리에서 빌드하면 네 문제의 표면이 사라집니다.
 
-### 원칙 3: 오프라인 샌드박스 (Windows Sandbox) 검증
-- **핵심**: "내 컴퓨터에선 되는데 남의 컴퓨터에선 안 되는" 현상을 방지합니다.
-- **해결책**:
-  - Windows Sandbox(`.wsb`) 설정 파일에서 `<Networking>Disable</Networking>`으로 인터넷을 완전 차단한 순정 윈도우 환경에 바이너리를 던져 테스트합니다.
-  - 인터넷이 없는 깡통 윈도우에서 돌아간다면, 지구상 모든 윈도우 PC에서 100% 무결하게 돌아갑니다.
+### 물리적 제원 (실측)
+| 항목 | 값 | 출처 |
+|---|---|---|
+| 단일 실행 파일 | **5,120 B** (clang+lld) / 5,632 B (MSVC) | CI run 43373628526, v1.0.0 run 43205024784도 5,120 B |
+| 임포트 | `KERNEL32.dll` — `GetStdHandle`, `WriteFile`, `SetConsoleOutputCP`, `GetCommandLineW`, `GetCurrentProcess`, `K32GetProcessMemoryInfo`, `ExitProcess` | 같은 run의 `llvm-readobj` |
+| 최대 작업 집합(RAM) | **2,860 KiB (2.79 MiB)** v1.0.0 run / 3,336 KiB (3.26 MiB) 이번 run | 자체 시험이 `K32GetProcessMemoryInfo`로 측정. run마다 다릅니다 |
+| 컴파일+링크 시간 | **0.23 ~ 0.38 s** | 개발기 clang 19.1.5 (`Measure-Command`, 3회). 0.1 s가 아닙니다 |
+| C 런타임 | 없음 (`-ffreestanding -nostdlib`, 진입점 `wz_main`) | 소스 |
+| 메모리 모델 | 힙 없음, 64 KiB 정적 아레나 | 소스 |
 
-> **검증 노트** — 샌드박스 통과는 "숨은 설치 의존성이 없다"는 강한 증거입니다. 하지만 "모든 PC에서 100%"까지 증명하지는 않습니다. 샌드박스는 호스트와 **같은 Windows 버전·아키텍처**입니다. 다른 버전(예: Windows 7), ARM64, 회사 정책(AppLocker·WDAC), 실행 파일 서명 여부는 따로 확인해야 합니다.
+### 원리 세 줄
+1. **C 런타임을 빼면 DLL 의존이 사라진다.** 보통의 `clang`/`cl` 빌드가 끌어오는 `ucrtbase.dll`·`vcruntime140.dll`이 바로 "DLL 누락"의 정체입니다. 진입점을 직접 쓰고(`mainCRTStartup` 또는 임의 이름) 필요한 Win32 함수를 직접 선언하면 링커가 넣을 DLL은 `KERNEL32.dll`만 남습니다. 정적 런타임(`/MT`)도 대안이지만 파일이 커집니다.
+2. **인코딩은 시작 시 한 번 고정한다.** `SetConsoleOutputCP(65001)` 뒤 모든 출력을 UTF-8 바이트로 씁니다. CP949 콘솔에서 한글이 깨지는 문제가 여기서 끝납니다.
+3. **빌드 산출물이 아니라 소스를 배포한다.** 받는 쪽이 한 줄 명령으로 자기 PC에서 굽습니다. 내려받은 exe에 붙는 Mark-of-the-Web은 생기지 않습니다. 단, Smart App Control은 그 표시와 별개로 **서명 없는 exe를 평판으로 차단**할 수 있으므로(§1), 보안 설정을 끄는 대신 코드 서명이나 SAC가 꺼진 환경·CI에서 검증하는 것이 정답입니다.
 
-## 3. [복붙용] AI(클로드·챗GPT·커서) 지휘 프롬프트 템플릿
-
-> **아래 프롬프트를 복사하여 AI 코딩 도구에 그대로 붙여넣으세요.**
+### AI 환각 방지 원샷 지휘문 (복사해서 Claude / ChatGPT / Cursor에 붙여넣기)
 
 ```markdown
-[목표: Windows 환경에서 외부 의존성 없이 0초 만에 즉시 실행되는 초경량 CLI/봇 개발]
+[목표: Windows에서 설치 없이 바로 실행되는 단일 C11 실행 파일 작성 — 외부 의존성 0]
 
-너는 Windows 저수준 시스템 엔지니어링 전문가다.
-사용자가 별도의 라이브러리나 C++ 빌드 툴을 설치하느라 고통받지 않도록, 아래 5대 무결성 원칙을 엄격히 지켜 코드를 작성하라.
+너는 Windows 저수준 시스템 엔지니어다. 아래 규칙을 어기는 코드는 제출하지 않는다.
 
-1. **외부 의존성 0% (Zero External Dependencies)**:
-   - Python 가상환경, 무거운 외부 패키지, C++ 런타임 DLL(msvcp140 등) 요구를 절대 금지한다.
-   - C/C++ 구현 시 오직 Windows 기본 내장 `KERNEL32.dll` / `USER32.dll` 표준 Win32 API만 링크하라.
-   - 단일 파일(`.exe`) 실행 시 "추가 구성 요소를 설치해야 합니다" 팝업이 절대 뜨지 않아야 한다.
-
-2. **콘솔 인코딩 무결성**:
-   - 시작 시 `SetConsoleOutputCP(CP_UTF8)` 및 `SetConsoleCP(CP_UTF8)`를 명시적으로 호출하여 한글 깨짐을 원천 차단하라.
-
-3. **메모리 및 자원 제약 (초경량 족쇄)**:
-   - 메모리 누수와 단편화를 방지하기 위해 정적 고정 버퍼 또는 Arena 메모리 풀 방식을 사용하라.
-   - 프로세스 상주 램(Working Set)은 최대 15MB 이하로 엄격히 고정하라.
-
-4. **오프라인/에어갭 생존 보장**:
-   - 인터넷 연결이 없는 상태에서도 핵심 로직 및 단위 테스트가 100% 자립 실행 가능하도록 설계하라.
-
-5. **결과물 제공 형식**:
-   - 누구나 바로 빌드할 수 있도록 단 한 줄의 컴파일 명령어(Clang 또는 GCC/TCC)를 함께 제시하라.
+1. 의존성: 임포트 DLL은 KERNEL32.dll 하나만 허용한다. USER32, WS2_32, ADVAPI32, 어떤 C 런타임 DLL
+   (ucrtbase, vcruntime140, msvcp140)도 금지. C 런타임 없이 빌드한다(-ffreestanding -nostdlib 또는
+   /NODEFAULTLIB, 진입점 직접 정의, memset/memcpy 직접 구현). Python·Node·pip 설치 요구 금지.
+2. 검증: 코드와 함께 (a) 한 줄 빌드 명령, (b) `dumpbin /dependents` 또는 `llvm-readobj --coff-imports`
+   결과를 KERNEL32.dll 하나로 확인하는 명령, (c) 종료 코드로 성패를 알리는 --selftest 모드를 제시한다.
+3. 경고 0: clang `-Wall -Wextra -pedantic -Werror`와 MSVC `/W4 /WX` 둘 다 통과해야 한다.
+4. 인코딩: 시작 시 SetConsoleOutputCP(65001) 호출, 모든 출력은 UTF-8 바이트.
+5. 메모리: 힙 대신 정적 버퍼/아레나. 자체 시험에서 K32GetProcessMemoryInfo로 최대 작업 집합을 측정해
+   출력하고 15 MiB 이하를 확인한다.
+6. 환각 금지: 측정하지 않은 성능 수치, 존재를 확인하지 않은 API, 실행하지 않은 테스트 결과를 적지 않는다.
+   모르면 "미측정/미확인"이라고 쓴다. 쓰는 KERNEL32 함수마다 최소 Windows 버전을 적는다.
+7. 서명: 실행 파일은 서명되지 않았음을 명시하고, Smart App Control이 차단할 수 있음과 서명 전 검증 경로
+   (CI 또는 SAC 비활성 환경)를 함께 적는다.
 ```
 
-> **검증 노트** — 이 프롬프트를 쓸 때 AI에게 두 가지를 더 요구하면 결과가 안정적입니다.
-> - "빌드 후 `dumpbin /dependents`로 의존 DLL 목록을 보여 줘."
-> - "실행 파일 서명 계획(또는 서명 전까지의 검증 경로)을 적어 줘."
+이 지휘문으로 만든 결과물이 이 저장소의 두 도구입니다. 규칙 2·3·6은 `ci.yml`이 기계적으로 집행합니다.
 
 ---
 
-# 레퍼런스 구현: `win_zero_cli`
+## 3. 슬랙·토큰 없는 0.4 ms Native Agent IPC Pipe (`agent_wire_ipc.c`)
 
-| 항목 | 내용 |
-|---|---|
-| 소스 | [`src/main.c`](src/main.c) — C11 파일 하나, SDK 헤더 없이 쓰는 Win32 함수만 직접 선언 |
-| 의존 DLL | `KERNEL32.dll` 하나. 쓰는 함수: `GetStdHandle`, `WriteFile`, `SetConsoleOutputCP`, `GetCommandLineW`, `GetCurrentProcess`, `K32GetProcessMemoryInfo`, `ExitProcess` |
-| C 런타임 | 없음 (`-ffreestanding -nostdlib`, 진입점 `wz_main`) |
-| 메모리 | 힙 없음, 64 KiB 정적 아레나. 자체 시험이 최대 작업 집합을 재고 15 MiB 이하를 확인 |
-| 최소 Windows | Windows 7 (`K32GetProcessMemoryInfo`), x64 |
+### 해결하는 문제
+같은 PC 안의 에이전트 둘(예: Claude Code 세션과 작업 러너, 또는 파이썬 봇과 C 도구)이 상태를 주고받으려 할 때 흔한 선택은 Slack 봇, 로컬 HTTP/WebSocket 서버, 파일 폴링입니다. 각각 토큰 발급·서버 프로세스·포트 개방·방화벽 예외가 붙고, 왕복은 수십~수백 ms입니다. Win32 named pipe는 커널이 이미 제공하는 로컬 IPC입니다. 토큰·포트·외부 런타임 없이 **두 프로세스가 64바이트 패킷을 메모리로 직접 핑퐁**합니다.
 
-## 빌드 (한 줄, LLVM clang)
+### 작동 원리
+- 파이프 `\\.\pipe\ultra_brain_agent_wire`, 메시지 모드(`PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE`), 원격 클라이언트 거부(`PIPE_REJECT_REMOTE_CLIENTS`), 인스턴스 1개, 입·출력 버퍼 각 **4,096 B**.
+- 파이프 계층이 쓰는 KERNEL32 함수는 **6개**: `CreateNamedPipeA`, `ConnectNamedPipe`, `CreateFileA`, `ReadFile`, `WriteFile`, `CloseHandle`. 나머지 10개 임포트(`GetStdHandle`, `GetCommandLineW`, `GetLastError`, `QueryPerformanceCounter/Frequency`, `Sleep`, `SetConsoleOutputCP`, `GetCurrentProcess`, `K32GetProcessMemoryInfo`, `ExitProcess`)는 콘솔 출력·인자·시간 측정·종료용입니다. 소켓·스레드·힙 없음.
+- 서버는 세션(클라이언트 연결 1회)을 순차로 처리합니다. 세션이 끝나면 핸들을 닫고 파이프를 다시 만듭니다. 클라이언트는 `CreateFileA`가 `ERROR_FILE_NOT_FOUND`/`ERROR_PIPE_BUSY`를 돌려주면 1 ms 간격으로 최대 약 3 s 재시도합니다.
 
-```bash
-clang -std=c11 -O2 -Wall -Wextra -pedantic -Werror -ffreestanding -nostdlib -fuse-ld=lld -Wl,/entry:wz_main -Wl,/subsystem:console src/main.c -lkernel32 -o win_zero_cli.exe
+### 정규 패킷 (64 B 고정, little-endian, `#pragma pack(1)`)
+```c
+typedef struct {
+    uint32_t magic;        /* 0x57495245 ("WIRE"; 바이트열 45 52 49 57) */
+    uint16_t version;      /* 0x0100 */
+    uint16_t opcode;       /* 1 PING, 2 TASK, 3 STATUS, 4 RECEIPT(서버→클라이언트 전용) */
+    uint32_t project_id;   /* 프로젝트 해시. 기본값 0xB1605844 = FNV-1a 32("ultra_brain_agent_wire") */
+    uint16_t sender_id;    /* 송신 에이전트 */
+    uint16_t receiver_id;  /* 수신 에이전트 */
+    uint32_t payload_len;  /* 0..40 */
+    uint32_t checksum;     /* FNV-1a 32, 도메인 = 이 필드를 제외한 나머지 60바이트 ([0,20) ∪ [24,64)) */
+    uint8_t  payload[40];
+} agent_packet_t;          /* offsetof(checksum) == 20, offsetof(payload) == 24 — 소스의 static assert */
+```
+- **RECEIPT 본문**(`payload_len` 14): `status u32 | request_checksum u32 | sequence u32 | request_opcode u16`. `sender_id`=1(서버), `receiver_id`=요청의 `sender_id`, `project_id` 에코.
+- **status**: 0 `ACK_OK`, 1 `BAD_SIZE`(메시지가 64 B가 아님), 2 `BAD_MAGIC`, 3 `BAD_VERSION`, 4 `BAD_OPCODE`(클라이언트가 RECEIPT를 보냄 등), 5 `BAD_LENGTH`(>40), 6 `BAD_CHECKSUM`. 거부된 패킷에도 영수증은 돌아가고 세션은 유지됩니다.
+- 골든 값(자체 시험·Python 테스트가 같은 값을 확인): PING(기본 project, 2→1, payload 0) 체크섬 `0x85BD5F54`; TASK `"hello"` 체크섬 `0x716CD786`.
+- 종료 코드: 0 성공, 1 파이프/시스템 오류, 2 사용법, 3 영수증 거부(status≠0 또는 체크섬·에코 불일치).
+
+### 모드
+```text
+agent_wire_ipc --server [sessions]   파이프 생성, 접속 대기, 패킷마다 검증 후 RECEIPT 즉답 (기본: 무한)
+agent_wire_ipc --client [text]       PING(또는 TASK text ≤ 40 B) 송신, 영수증 검증, 왕복 시간 µs 출력
+agent_wire_ipc --bench [count]       count회(기본 1,000, 최대 16,384) PING 왕복, min/p50/avg/p99/max·처리량·최대 작업 집합
+agent_wire_ipc --selftest            레이아웃·FNV 벡터·골든 체크섬·검증·영수증·포매터 11건
+agent_wire_ipc --version             1.1.0
 ```
 
-`kernel32.lib`는 Windows SDK에 있습니다. Visual Studio Build Tools의 LLVM이나 GitHub Actions의 `windows-latest`라면 그대로 동작합니다.
+### 벤치마크 실측치 — CI run [43373628526](https://github.com/CSY8515/Ultra-Brain-Labs/actions/runs/43373628526), `windows-latest`, 1,000회 PING→RECEIPT 왕복, 영수증 전부 검증
 
-## 사용
+| 빌드 | min | p50 | avg | p99 | max | 처리량 | 최대 작업 집합 | exe 크기 |
+|---|---|---|---|---|---|---|---|---|
+| clang 20.1.8 + lld | 0.005 ms | 0.031 ms | **0.040 ms** | 0.066 ms | 7.859 ms | 24,596 왕복/s | 2,960 KiB (2.89 MiB) | 23,552 B |
+| MSVC 19.51 | 0.018 ms | 0.026 ms | **0.038 ms** | 0.063 ms | 9.770 ms | 25,855 왕복/s | 2,980 KiB (2.91 MiB) | 22,016 B |
+| Python 3.13 클라이언트 → C 서버 (단위 테스트, 200회) | 0.027 ms | 0.033 ms | 0.034 ms | 0.063 ms | 0.084 ms | — | 2,940 KiB | — |
+
+- **"0.4 ms"는 상한으로 읽으십시오.** 지시 사양은 0.4 ms급이었고, 실측 평균은 그 10분의 1(0.04 ms)입니다. 러너는 공유 가상머신이라 run마다 수치가 달라집니다. 같은 run의 Python 단일 PING 왕복은 58 µs였습니다.
+- **max 7.9~9.8 ms는 첫 왕복입니다.** `--client`의 단발 TASK 왕복도 9.7 ms(clang)/10.5 ms(MSVC)로, 연결 직후 첫 패킷이 스케줄링·페이지 폴트 비용을 떠안습니다. 두 번째 패킷부터 수십 µs입니다. 지연이 중요한 쪽은 연결 후 PING 한 번으로 워밍업하십시오.
+- **로컬 측정은 NOT_RUN.** 개발기는 Smart App Control이 빌드 직후의 exe 실행을 차단해 수치를 내지 못했습니다. 위 표의 모든 숫자는 CI 로그에서 복사했고 산출물 `labs-clang`/`labs-msvc`의 `bench_*.txt`가 원문입니다.
+- 작업 집합 2.9 MiB는 64 B 패킷 1,000개를 돌린 클라이언트 프로세스의 최대값입니다. 정적 버퍼(벤치 표본 128 KiB, 파이프 inbox 4 KiB)를 포함합니다.
+
+### 파이썬 연동 (표준 라이브러리만, 20줄)
+서버를 `agent_wire_ipc --server`로 띄운 뒤 아무 파이썬 에이전트에서 다음을 실행합니다. 같은 코드가 [`tests/test_agent_wire_ipc.py`](tests/test_agent_wire_ipc.py)에서 CI마다 돕니다.
+
+```python
+import struct, time
+PIPE = r"\\.\pipe\ultra_brain_agent_wire"
+def fnv1a(data, h=0x811C9DC5):
+    for b in data: h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+def packet(opcode, payload=b"", project=0xB1605844, sender=2, receiver=1):
+    head = struct.pack("<IHHIHHI", 0x57495245, 0x0100, opcode, project, sender, receiver, len(payload))
+    body = payload.ljust(40, b"\0")
+    return head + struct.pack("<I", fnv1a(head + body)) + body          # checksum = other 60 bytes
+with open(PIPE, "r+b", buffering=0) as pipe:                            # CreateFile on the pipe
+    request = packet(2, b"task: summarize README")                      # 2 = TASK (<= 40 bytes)
+    t0 = time.perf_counter(); pipe.write(request); raw = pipe.read(64)  # one 64-byte RECEIPT back
+    rtt_us = (time.perf_counter() - t0) * 1e6
+status, echoed, sequence, req_opcode = struct.unpack_from("<IIIH", raw, 24)
+assert raw[:4] == b"ERIW" and struct.unpack_from("<H", raw, 6)[0] == 4  # magic, RECEIPT
+assert struct.unpack_from("<I", raw, 20)[0] == fnv1a(raw[:20] + raw[24:])  # receipt checksum
+assert status == 0 and echoed == struct.unpack_from("<I", request, 20)[0]   # ACK_OK for our packet
+print(f"ACK sequence {sequence} for opcode {req_opcode}, rtt {rtt_us:.0f} us")
+```
+`open()`이 곧 `CreateFile`입니다. `pywin32`·`win32file`·소켓·HTTP 라이브러리가 필요 없습니다. 거부된 패킷은 예외가 아니라 `status` 1~6으로 돌아옵니다.
+
+---
+
+## 4. 실전 연계: Zero-Dependency Local Multi-Agent Architecture
+
+Part 1은 에이전트가 **도구를 실행하는 비용**을, Part 2는 에이전트끼리 **상태를 주고받는 비용**을 깎습니다. 둘을 합친 구성은 다음과 같습니다.
 
 ```text
-win_zero_cli              인사말 (UTF-8 한글, 종료 코드 0)
-win_zero_cli --selftest   자체 시험 4개 (UTF-8 검증기, 아레나, 숫자 변환, 작업 집합 15 MiB 이하) — 모두 통과 시 0
-win_zero_cli --version    1.0.0
+   Agent A (조정자: Claude Code / Python 봇)              Agent B (실행자: 로컬 러너)
+   ┌──────────────────────────────┐                      ┌──────────────────────────────┐
+   │ 1. 작업 분해, project_id 결정 │    TASK  (64 B)      │ 4. TASK 수신 → 도구 실행      │
+   │ 2. TASK 송신 (sender 2→1)     │ ───────────────────▶ │    win_zero_cli 류 5 KB CLI   │
+   │ 3. RECEIPT 검증, sequence 기록│ ◀─────────────────── │    (설치 없음, KERNEL32 전용) │
+   │                              │   RECEIPT (64 B)     │ 5. 진척도를 STATUS로 보고     │
+   │ 6. STATUS 수신 → 다음 TASK    │ ◀──────────────────▶ │    (payload: 단계/백분율/코드) │
+   └──────────────────────────────┘  \\.\pipe\ultra_brain_agent_wire   └──────────────────────────────┘
+                 ▲ 메모리 직통, 커널 named pipe, 왕복 ≈ 0.04 ms (CI 실측 평균), 네트워크 스택 미사용
 ```
 
-## 검증
+- **역할 고정.** 파이프 인스턴스는 1개이고 서버(`sender_id` 1)가 영수증을 발행합니다. 조정자와 실행자 중 누가 서버가 되든 상관없지만, 한 세션에서 요청 방향은 클라이언트→서버 하나입니다. 양방향 요청이 필요하면 각자 서버 하나씩, 파이프 두 개(이름을 바꿔 빌드)로 둡니다.
+- **충돌 없는 분담.** `project_id`(프로젝트 이름의 FNV-1a 32)가 네임스페이스, `sender_id`/`receiver_id`가 에이전트 주소, 서버의 `sequence`가 세션 안의 단조 증가 카운터입니다. 같은 TASK가 두 번 가면 영수증의 `request_checksum`이 같으므로 조정자가 중복을 식별합니다. 손상된 패킷은 `BAD_CHECKSUM` 영수증으로 돌아오고 세션은 끊기지 않습니다.
+- **진척도 핑퐁.** STATUS payload 40 B에 "단계 번호 | 백분율 | 마지막 종료 코드 | 짧은 메시지"를 넣습니다(형식은 두 에이전트의 약속이며 서버는 길이·체크섬만 검사합니다). 조정자는 영수증 `sequence`로 유실을 감지합니다.
+- **완전 오프라인.** 두 프로세스는 네트워크 스택을 열지 않습니다(WS2_32 임포트 없음). 파이프는 `PIPE_REJECT_REMOTE_CLIENTS`로 원격 접속을 거부합니다. 인터넷·DNS·토큰 서버가 없어도 CI의 시나리오와 동일하게 돕니다. Windows Sandbox의 `<Networking>Disable</Networking>` 환경에서도 동작 조건은 같습니다(이 저장소는 그 환경을 CI로 대신했고, 샌드박스 실측은 하지 않았습니다).
+- **제공하지 않는 것.** 브로드캐스트·다중 클라이언트 동시 접속(인스턴스 1), 메시지 영속화, 로컬 ACL 이상의 인증, 40 B를 넘는 payload(파일 경로나 해시를 보내고 내용은 파일로 주고받는 것이 설계 의도입니다).
 
-- CI: [Windows CI](.github/workflows/ci.yml) — `windows-latest`에서 다음을 확인합니다.
-  - 빌드 경고 0(컴파일러 출력이 있으면 실패)
-  - `dumpbin /dependents` 결과가 `KERNEL32.dll` 하나인지
-  - 인사말과 자체 시험의 종료 코드 0
-  - 단위 테스트 [`tests/test_win_zero_cli.py`](tests/test_win_zero_cli.py): 표준 라이브러리만으로 PE import 표 읽기, UTF-8 엄격 디코딩, 작업 집합 15 MiB 이하
-- 배포 바이너리: Release에 첨부한 `win_zero_cli.exe`는 CI가 빌드하고 검증한 바로 그 파일입니다(SHA-256은 Release 노트와 CI 요약에 있음).
-- **서명되지 않은 바이너리입니다.** Smart App Control이 켜진 PC에서는 막힐 수 있습니다. 그럴 때는 위 한 줄 명령으로 직접 빌드하거나 CI 결과를 확인하세요.
+---
 
 ## 직접 시험하기
 
-```bash
-python -m unittest -v tests.test_win_zero_cli
+```bat
+build.cmd
+agent_wire_ipc.exe --selftest
+pwsh scripts\wire_scenario.ps1 -Exe .\agent_wire_ipc.exe -Count 1000
+python -m unittest -v tests.test_win_zero_cli tests.test_agent_wire_ipc
 ```
 
-`win_zero_cli.exe`가 현재 폴더에 있어야 합니다(다른 위치는 `WIN_ZERO_CLI` 환경 변수로 지정).
+`dumpbin /dependents agent_wire_ipc.exe` 또는 `llvm-readobj --coff-imports agent_wire_ipc.exe`로 의존 DLL이 `KERNEL32.dll` 하나인지 직접 확인할 수 있습니다. Smart App Control이 켜진 PC에서 exe가 막히면 CI run의 로그와 산출물로 같은 검증을 읽을 수 있습니다.
+
+## 한계 (v1.1.0)
+- 바이너리는 서명되지 않았습니다. Release 첨부 exe는 CI가 빌드·검증한 파일이며 SHA-256은 Release 노트에 있습니다.
+- 벤치 수치는 공유 CI 러너의 한 run이며 하드웨어 보장치가 아닙니다. 첫 왕복 ~10 ms는 설계상 워밍업으로 흡수해야 합니다.
+- 로컬 개발기 실측은 Smart App Control 차단으로 NOT_RUN입니다. Windows Sandbox 실측도 하지 않았습니다.
+- `agent_wire_ipc.exe`는 `-O2` 기준 22~24 KB입니다(인라인 확장 포함). 크기가 우선이면 `-Os`로 다시 빌드할 수 있으나 이 저장소는 그 수치를 측정하지 않았습니다.
