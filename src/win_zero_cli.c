@@ -9,7 +9,7 @@
  *
  * Build (one line, LLVM clang for Windows):
  *   clang -std=c11 -O2 -Wall -Wextra -pedantic -Werror -ffreestanding -nostdlib -fuse-ld=lld
- *         -Wl,/entry:wz_main -Wl,/subsystem:console src/main.c -lkernel32 -o win_zero_cli.exe
+ *         -Wl,/entry:wz_main -Wl,/subsystem:console src/win_zero_cli.c -lkernel32 -o win_zero_cli.exe
  *
  * Usage:
  *   win_zero_cli              greeting (UTF-8, exit 0)
@@ -54,7 +54,11 @@ WZ_IMPORT __declspec(noreturn) void WZ_API ExitProcess(unsigned int code);
 #define WZ_VERSION "1.0.0"
 #define WZ_WORKING_SET_LIMIT (15u * 1024u * 1024u)
 
-/* A freestanding build still lets the compiler emit these two calls. */
+/* A freestanding build still lets the compiler emit these two calls. MSVC needs to be told
+ * that the intrinsics are being defined here (clang defines _MSC_VER too, so exclude it). */
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma function(memset, memcpy)
+#endif
 void *memset(void *dest, int value, size_t count);
 void *memcpy(void *dest, const void *src, size_t count);
 void *memset(void *dest, int value, size_t count) {

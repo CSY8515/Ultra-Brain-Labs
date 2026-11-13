@@ -3,7 +3,7 @@
 Ultra-Brain에서 나온 실전 엔지니어링 결과물을 공개하는 저장소입니다. 첫 번째 결과물은 Windows용 무의존성 CLI 가이드와, 그 가이드대로 만든 레퍼런스 구현입니다.
 
 - **가이드**: Windows CLI·봇 개발 "덜그덕거림 0%" 엔지니어링 (아래)
-- **레퍼런스 구현**: [`src/main.c`](src/main.c) → `win_zero_cli.exe`
+- **레퍼런스 구현**: [`src/win_zero_cli.c`](src/win_zero_cli.c) → `win_zero_cli.exe`
   - C11 파일 하나, C 런타임 없음, import는 `KERNEL32.dll` 하나뿐
   - 한글 UTF-8 출력, 정적 아레나 메모리, 자체 시험
 - **검증**: [Windows CI](.github/workflows/ci.yml) — 엄격 빌드 경고 0, `dumpbin`·`llvm-objdump`·자체 PE 파서로 의존 DLL 검사, 실행 시험, 단위 테스트
@@ -98,7 +98,7 @@ Ultra-Brain에서 나온 실전 엔지니어링 결과물을 공개하는 저장
 
 | 항목 | 내용 |
 |---|---|
-| 소스 | [`src/main.c`](src/main.c) — C11 파일 하나, SDK 헤더 없이 쓰는 Win32 함수만 직접 선언 |
+| 소스 | [`src/win_zero_cli.c`](src/win_zero_cli.c) — C11 파일 하나, SDK 헤더 없이 쓰는 Win32 함수만 직접 선언 |
 | 의존 DLL | `KERNEL32.dll` 하나. 쓰는 함수: `GetStdHandle`, `WriteFile`, `SetConsoleOutputCP`, `GetCommandLineW`, `GetCurrentProcess`, `K32GetProcessMemoryInfo`, `ExitProcess` |
 | C 런타임 | 없음 (`-ffreestanding -nostdlib`, 진입점 `wz_main`) |
 | 메모리 | 힙 없음, 64 KiB 정적 아레나. 자체 시험이 최대 작업 집합을 재고 15 MiB 이하를 확인 |
@@ -107,7 +107,7 @@ Ultra-Brain에서 나온 실전 엔지니어링 결과물을 공개하는 저장
 ## 빌드 (한 줄, LLVM clang)
 
 ```bash
-clang -std=c11 -O2 -Wall -Wextra -pedantic -Werror -ffreestanding -nostdlib -fuse-ld=lld -Wl,/entry:wz_main -Wl,/subsystem:console src/main.c -lkernel32 -o win_zero_cli.exe
+clang -std=c11 -O2 -Wall -Wextra -pedantic -Werror -ffreestanding -nostdlib -fuse-ld=lld -Wl,/entry:wz_main -Wl,/subsystem:console src/win_zero_cli.c -lkernel32 -o win_zero_cli.exe
 ```
 
 `kernel32.lib`는 Windows SDK에 있습니다. Visual Studio Build Tools의 LLVM이나 GitHub Actions의 `windows-latest`라면 그대로 동작합니다.
