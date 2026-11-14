@@ -6,14 +6,30 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      soak_rounds:
+        description: 'MCP soak: rounds'
+        default: '20'
+      soak_calls:
+        description: 'MCP soak: tools/call requests per round'
+        default: '250000'
+      soak_idle_seconds:
+        description: 'MCP soak: idle window in seconds'
+        default: '60'
 
 permissions:
   contents: read
+
+env:
+  SOAK_ROUNDS: ${{ inputs.soak_rounds || '20' }}
+  SOAK_CALLS: ${{ inputs.soak_calls || '250000' }}
+  SOAK_IDLE_SECONDS: ${{ inputs.soak_idle_seconds || '60' }}
 
 jobs:
   clang:
     name: clang + lld (windows-latest)
     runs-on: windows-latest
+    timeout-minutes: 45
     defaults:
       run:
         shell: pwsh
@@ -34,7 +50,8 @@ jobs:
         run: |
           $builds = @(
             @{ src = 'src/win_zero_cli.c';   exe = 'win_zero_cli.exe';   extra = @('-Wl,/entry:wz_main') },
-            @{ src = 'src/agent_wire_ipc.c'; exe = 'agent_wire_ipc.exe'; extra = @() }
+            @{ src = 'src/agent_wire_ipc.c'; exe = 'agent_wire_ipc.exe'; extra = @() },
+            @{ src = 'src/agent_wire_mcp.c'; exe = 'agent_wire_mcp.exe'; extra = @() }
           )
           foreach ($b in $builds) {
             $args = @('-std=c11', '-O2', '-Wall', '-Wextra', '-pedantic', '-Werror', '-ffreestanding', '-nostdlib', '-fuse-ld=lld') + $b.extra + @('-Wl,/subsystem:console', $b.src, '-lkernel32', '-o', $b.exe)
@@ -51,7 +68,7 @@ jobs:
         run: |
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
           $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe | Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1
-          foreach ($exe in 'win_zero_cli.exe', 'agent_wire_ipc.exe') {
+          foreach ($exe in 'win_zero_cli.exe', 'agent_wire_ipc.exe', 'agent_wire_mcp.exe') {
             $deps = & $dumpbin.FullName /nologo /dependents $exe | Out-String
             $dlls = [regex]::Matches($deps, '(?im)^\s+(\S+\.dll)\s*$') | ForEach-Object { $_.Groups[1].Value.ToUpper() }
             if (($dlls -join ',') -ne 'KERNEL32.DLL') { Write-Host $deps; throw "$exe has unexpected DLL dependencies: $($dlls -join ', ')" }
@@ -68,8 +85,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Host $wz; throw "win_zero_cli self-test exit $LASTEXITCODE" }
           $aw = & .\agent_wire_ipc.exe --selftest | Out-String
           if ($LASTEXITCODE -ne 0) { Write-Host $aw; throw "agent_wire_ipc self-test exit $LASTEXITCODE" }
-          Write-Host $wz; Write-Host $aw
-          "`n``````text`n$wz$aw``````" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $mw = & .\agent_wire_mcp.exe --selftest | Out-String
+          if ($LASTEXITCODE -ne 0) { Write-Host $mw; throw "agent_wire_mcp self-test exit $LASTEXITCODE" }
+          Write-Host $wz; Write-Host $aw; Write-Host $mw
+          "`n``````text`n$wz$aw$mw``````" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: Agent wire scenario (server + client + bench 1000)
         run: |
@@ -78,10 +97,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "wire scenario failed" }
           "`n### agent_wire_ipc scenario (clang build)`n``````text`n$(Get-Content bench_clang.txt -Raw)``````" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Unit tests (Python standard library drives the pipe)
+      - name: Unit tests (Python standard library drives the pipe and the MCP stdio)
         env:
           PYTHONUTF8: '1'
-        run: python -m unittest -v tests.test_win_zero_cli tests.test_agent_wire_ipc
+        run: python -m unittest -v tests.test_win_zero_cli tests.test_agent_wire_ipc tests.test_agent_wire_mcp
+
+      - name: MCP soak (tools/call -> named pipe round trips; memory, idle CPU, latency)
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          python scripts/mcp_soak.py --mcp .\agent_wire_mcp.exe --wire .\agent_wire_ipc.exe --rounds $env:SOAK_ROUNDS --calls $env:SOAK_CALLS --idle-seconds $env:SOAK_IDLE_SECONDS --label "(clang build)" --out-text soak_clang.txt --out-json soak_clang.json
+          $soak = $LASTEXITCODE
+          if (Test-Path soak_clang.txt) { "`n### agent_wire_mcp soak (clang build)`n``````text`n$(Get-Content soak_clang.txt -Raw)``````" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
+          if ($soak -ne 0) { throw "MCP soak failed (exit $soak)" }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -89,17 +117,25 @@ jobs:
           path: |
             win_zero_cli.exe
             agent_wire_ipc.exe
+            agent_wire_mcp.exe
             bench_clang.txt
+            soak_clang.txt
+            soak_clang.json
           if-no-files-found: error
 
   msvc:
     name: MSVC /W4 /WX (windows-latest)
     runs-on: windows-latest
+    timeout-minutes: 45
     defaults:
       run:
         shell: pwsh
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
 
       - name: MSVC environment (vcvars64)
         run: |
@@ -117,7 +153,8 @@ jobs:
         run: |
           $builds = @(
             @{ src = 'src\win_zero_cli.c';   exe = 'win_zero_cli.exe';   entry = @('/ENTRY:wz_main') },
-            @{ src = 'src\agent_wire_ipc.c'; exe = 'agent_wire_ipc.exe'; entry = @() }
+            @{ src = 'src\agent_wire_ipc.c'; exe = 'agent_wire_ipc.exe'; entry = @() },
+            @{ src = 'src\agent_wire_mcp.c'; exe = 'agent_wire_mcp.exe'; entry = @() }
           )
           foreach ($b in $builds) {
             $args = @('/nologo', '/std:c11', '/O2', '/W4', '/WX', '/utf-8', '/GS-', $b.src, '/link', '/SUBSYSTEM:CONSOLE', '/NODEFAULTLIB') + $b.entry + @('kernel32.lib', "/OUT:$($b.exe)")
@@ -133,7 +170,7 @@ jobs:
 
       - name: Imports (dumpbin)
         run: |
-          foreach ($exe in 'win_zero_cli.exe', 'agent_wire_ipc.exe') {
+          foreach ($exe in 'win_zero_cli.exe', 'agent_wire_ipc.exe', 'agent_wire_mcp.exe') {
             $deps = dumpbin /nologo /dependents $exe | Out-String
             $dlls = [regex]::Matches($deps, '(?im)^\s+(\S+\.dll)\s*$') | ForEach-Object { $_.Groups[1].Value.ToUpper() }
             if (($dlls -join ',') -ne 'KERNEL32.DLL') { Write-Host $deps; throw "$exe has unexpected DLL dependencies: $($dlls -join ', ')" }
@@ -150,8 +187,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Host $wz; throw "win_zero_cli self-test exit $LASTEXITCODE" }
           $aw = & .\agent_wire_ipc.exe --selftest | Out-String
           if ($LASTEXITCODE -ne 0) { Write-Host $aw; throw "agent_wire_ipc self-test exit $LASTEXITCODE" }
-          Write-Host $wz; Write-Host $aw
-          "`n``````text`n$wz$aw``````" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $mw = & .\agent_wire_mcp.exe --selftest | Out-String
+          if ($LASTEXITCODE -ne 0) { Write-Host $mw; throw "agent_wire_mcp self-test exit $LASTEXITCODE" }
+          Write-Host $wz; Write-Host $aw; Write-Host $mw
+          "`n``````text`n$wz$aw$mw``````" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: Agent wire scenario (server + client + bench 1000)
         run: |
@@ -160,11 +199,28 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "wire scenario failed" }
           "`n### agent_wire_ipc scenario (MSVC build)`n``````text`n$(Get-Content bench_msvc.txt -Raw)``````" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
+      - name: Unit tests (Python standard library drives the pipe and the MCP stdio)
+        env:
+          PYTHONUTF8: '1'
+        run: python -m unittest -v tests.test_win_zero_cli tests.test_agent_wire_ipc tests.test_agent_wire_mcp
+
+      - name: MCP soak (tools/call -> named pipe round trips; memory, idle CPU, latency)
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          python scripts/mcp_soak.py --mcp .\agent_wire_mcp.exe --wire .\agent_wire_ipc.exe --rounds $env:SOAK_ROUNDS --calls $env:SOAK_CALLS --idle-seconds $env:SOAK_IDLE_SECONDS --label "(MSVC build)" --out-text soak_msvc.txt --out-json soak_msvc.json
+          $soak = $LASTEXITCODE
+          if (Test-Path soak_msvc.txt) { "`n### agent_wire_mcp soak (MSVC build)`n``````text`n$(Get-Content soak_msvc.txt -Raw)``````" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
+          if ($soak -ne 0) { throw "MCP soak failed (exit $soak)" }
+
       - uses: actions/upload-artifact@v4
         with:
           name: labs-msvc
           path: |
             win_zero_cli.exe
             agent_wire_ipc.exe
+            agent_wire_mcp.exe
             bench_msvc.txt
+            soak_msvc.txt
+            soak_msvc.json
           if-no-files-found: error
