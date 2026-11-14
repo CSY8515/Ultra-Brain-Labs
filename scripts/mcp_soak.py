@@ -1,7 +1,7 @@
 """Soak run for agent_wire_mcp.exe: many MCP tools/call requests, each one a real named-pipe round trip.
 
     python scripts/mcp_soak.py --mcp agent_wire_mcp.exe --wire agent_wire_ipc.exe
-                               [--rounds 20] [--calls 50000] [--idle-seconds 60]
+                               [--rounds 20] [--calls 250000] [--idle-seconds 60]
                                [--out-text soak.txt] [--out-json soak.json] [--label msvc]
 
 One agent_wire_ipc --server process and one agent_wire_mcp process run for the whole test. This script is
@@ -10,9 +10,11 @@ the MCP host: it writes JSON-RPC lines to the adapter's stdin and reads the repl
 What is measured, and with which counter (all read from outside the two processes, through their handles):
   private bytes, working set   K32GetProcessMemoryInfo (PROCESS_MEMORY_COUNTERS_EX), sampled after every round
   handle count                 GetProcessHandleCount, sampled after every round
+  thread count                 CreateToolhelp32Snapshot thread list, sampled after every round (reported only)
   CPU time                     GetProcessTimes (kernel + user, 100 ns units, accounted in scheduler ticks)
   CPU cycles                   QueryProcessCycleTime (exact cycle count charged to the process)
-  MCP call latency             time.perf_counter_ns around "write request line, read reply line" in this script
+  MCP call latency             time.perf_counter_ns around "write request line, read reply line" in this script;
+                               it includes this Python host's own pipe I/O (one write, buffered line read)
   pipe round-trip time         rtt_us reported by the adapter (QueryPerformanceCounter around WriteFile/ReadFile)
 
 Pass criteria, fixed before the first measured run and not tuned afterwards:
@@ -29,6 +31,7 @@ from array import array
 import ctypes
 from ctypes import wintypes
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -60,6 +63,47 @@ kernel32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(Mem
 kernel32.GetProcessHandleCount.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
 kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
 kernel32.QueryProcessCycleTime.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_ulonglong)]
+
+
+class ThreadEntry(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ThreadID", wintypes.DWORD),
+                ("th32OwnerProcessID", wintypes.DWORD), ("tpBasePri", wintypes.LONG), ("tpDeltaPri", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD)]
+
+
+kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+kernel32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)]
+kernel32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(ThreadEntry)]
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+
+def thread_counts(pids) -> dict:
+    """Threads per process id, from one system-wide thread snapshot."""
+    counts = {pid: 0 for pid in pids}
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)        # TH32CS_SNAPTHREAD
+    if snapshot is None or snapshot == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        entry = ThreadEntry()
+        entry.dwSize = ctypes.sizeof(entry)
+        more = kernel32.Thread32First(snapshot, ctypes.byref(entry))
+        while more:
+            if entry.th32OwnerProcessID in counts:
+                counts[entry.th32OwnerProcessID] += 1
+            more = kernel32.Thread32Next(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return counts
+
+
+def sample_both(adapter: subprocess.Popen, server: subprocess.Popen) -> dict:
+    """One sample of both processes: {"adapter": {...}, "server": {...}}."""
+    result = {"adapter": sample(adapter), "server": sample(server)}
+    threads = thread_counts((adapter.pid, server.pid))
+    result["adapter"]["threads"] = threads[adapter.pid]
+    result["server"]["threads"] = threads[server.pid]
+    return result
 
 
 def sample(process: subprocess.Popen) -> dict:
@@ -103,7 +147,9 @@ class Host:
     def __init__(self, mcp: Path):
         self.process = subprocess.Popen([str(mcp)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, bufsize=0)
-        self.reader = self.process.stdout
+        # stdin is unbuffered (one WriteFile per request); replies are read through a buffer. A raw
+        # readline() would issue one ReadFile per byte and charge that to the measured call latency.
+        self.reader = io.BufferedReader(self.process.stdout, buffer_size=65536)
         self.next_id = 0
         self.sequence = 0                    # server sequence number expected on the next pipe round trip
         self.tool_calls = 0
@@ -177,7 +223,7 @@ def main() -> int:
     parser.add_argument("--mcp", default="agent_wire_mcp.exe")
     parser.add_argument("--wire", default="agent_wire_ipc.exe")
     parser.add_argument("--rounds", type=int, default=20)
-    parser.add_argument("--calls", type=int, default=50000, help="tools/call requests per round")
+    parser.add_argument("--calls", type=int, default=250000, help="tools/call requests per round")
     parser.add_argument("--idle-seconds", type=float, default=60.0)
     parser.add_argument("--label", default="")
     parser.add_argument("--out-text", default="")
@@ -204,7 +250,7 @@ def main() -> int:
         host.sequence, host.tool_calls = 1, 1
         for index in range(WARMUP_CALLS):
             host.roundtrip(index, record=False)
-        after_warmup = {"adapter": sample(host.process), "server": sample(server)}
+        after_warmup = sample_both(host.process, server)
 
         load_started = time.perf_counter()
         index = WARMUP_CALLS
@@ -218,21 +264,20 @@ def main() -> int:
                     host.request("tools/list")
             seconds = time.perf_counter() - round_started
             rounds.append({"round": number, "seconds": round(seconds, 3),
-                           "calls_per_second": round(options.calls / seconds),
-                           "adapter": sample(host.process), "server": sample(server)})
+                           "calls_per_second": round(options.calls / seconds), **sample_both(host.process, server)})
         load_seconds = time.perf_counter() - load_started
 
-        before_idle = {"adapter": sample(host.process), "server": sample(server)}
+        before_idle = sample_both(host.process, server)
         idle_started = time.perf_counter()
         time.sleep(options.idle_seconds)
         idle_seconds = time.perf_counter() - idle_started
-        after_idle = {"adapter": sample(host.process), "server": sample(server)}
+        after_idle = sample_both(host.process, server)
 
         for _ in range(POST_IDLE_CALLS):                 # still serving after the idle window
             host.roundtrip(index, record=False)
             index += 1
         final_status = host.status()
-        final = {"adapter": sample(host.process), "server": sample(server)}
+        final = sample_both(host.process, server)
         expected_packets = host.sequence
 
         host.process.stdin.close()
@@ -244,7 +289,7 @@ def main() -> int:
                 process.kill()
         raise
     finally:
-        host.process.stdout.close()
+        host.reader.close()
     server_text = server_log.read_text(encoding="utf-8", errors="replace")
     server_log.unlink(missing_ok=True)
 
@@ -265,8 +310,11 @@ def main() -> int:
         private = final[name]["private_bytes"] - baseline[name]["private_bytes"]
         handles = final[name]["handles"] - baseline[name]["handles"]
         series = [entry[name]["private_bytes"] for entry in rounds]
+        thread_series = [entry[name]["threads"] for entry in rounds]
         growth[name] = {"private_bytes_growth": private, "handles_growth": handles,
                         "private_bytes_round_min": min(series), "private_bytes_round_max": max(series),
+                        "private_bytes_by_round": series, "threads_by_round": thread_series,
+                        "rounds_at_final_private_bytes": sum(1 for v in series if v == final[name]["private_bytes"]),
                         "working_set_growth": final[name]["working_set_bytes"] - baseline[name]["working_set_bytes"]}
         if private > PRIVATE_GROWTH_LIMIT:
             failures.append(f"{name} private bytes grew by {private} (> {PRIVATE_GROWTH_LIMIT})")
@@ -339,7 +387,13 @@ def main() -> int:
             f"(limit +{PRIVATE_GROWTH_LIMIT:,}); per-round range {kib(growth[name]['private_bytes_round_min'])}.."
             f"{kib(growth[name]['private_bytes_round_max'])}; working set {kib(baseline[name]['working_set_bytes'])} -> "
             f"{kib(final[name]['working_set_bytes'])}, peak {kib(final[name]['peak_working_set_bytes'])}; "
-            f"handles {baseline[name]['handles']} -> {final[name]['handles']}")
+            f"handles {baseline[name]['handles']} -> {final[name]['handles']}; threads per round "
+            f"{min(growth[name]['threads_by_round'])}..{max(growth[name]['threads_by_round'])} "
+            f"({final[name]['threads']} at the end)")
+        lines.append(f"  {name + ' private KiB':<20} by round: "
+                     + " ".join(str(v // 1024) for v in growth[name]["private_bytes_by_round"]))
+        lines.append(f"  {name + ' threads':<20} by round: "
+                     + " ".join(str(v) for v in growth[name]["threads_by_round"]))
     for name in ("adapter", "server"):
         lines.append(
             f"  {name + ' idle CPU':<20} {idle[name]['cpu_ms']:.3f} ms of CPU time and {idle[name]['cycles']:,} cycles in "

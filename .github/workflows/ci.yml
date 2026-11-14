@@ -12,7 +12,7 @@ on:
         default: '20'
       soak_calls:
         description: 'MCP soak: tools/call requests per round'
-        default: '50000'
+        default: '250000'
       soak_idle_seconds:
         description: 'MCP soak: idle window in seconds'
         default: '60'
@@ -22,7 +22,7 @@ permissions:
 
 env:
   SOAK_ROUNDS: ${{ inputs.soak_rounds || '20' }}
-  SOAK_CALLS: ${{ inputs.soak_calls || '50000' }}
+  SOAK_CALLS: ${{ inputs.soak_calls || '250000' }}
   SOAK_IDLE_SECONDS: ${{ inputs.soak_idle_seconds || '60' }}
 
 jobs:
