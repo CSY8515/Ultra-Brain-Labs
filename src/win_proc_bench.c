@@ -5,7 +5,8 @@
  * itself as children and measures them from outside:
  *
  *   win_proc_bench --floor [repeats]   private commit and working set of an idle child with no C runtime:
- *                                      one thread; one thread and an anonymous pipe; two threads
+ *                                      one thread; one thread and an anonymous pipe; two threads; one
+ *                                      thread and 1 MiB of static storage of which one byte is written
  *   win_proc_bench --kill [count]      a child in a Job Object is ended with TerminateJobObject; three clock
  *                                      readings in one process: the request, the return of the call, the
  *                                      moment the process object is signalled. The observer first spins on
@@ -16,7 +17,7 @@
  *   win_proc_bench --selftest          arithmetic of the statistics (exit 0 = pass)
  *   win_proc_bench --version
  *
- * Children (started by the program itself): --idle, --idle-pipe, --idle-thread, --busy <handle>.
+ * Children (started by the program itself): --idle, --idle-pipe, --idle-thread, --idle-ballast, --busy <handle>.
  *
  * Every figure is what Windows did on the machine that ran it, once. Percentiles are nearest rank over the
  * sorted samples. Nothing here says how long ending a larger process takes.
@@ -284,6 +285,7 @@ static int pb_parse_u64(const char *text, uint64_t *value) {
 
 /* ---- children ------------------------------------------------------------------------------------ */
 static uint16_t pb_self_path[1024];
+static volatile unsigned char pb_ballast[1048576];   /* --idle-ballast: static storage that is never read */
 static uint16_t pb_command[1200];
 
 static pb_dword PB_API pb_sleeper(void *unused) {
@@ -291,9 +293,10 @@ static pb_dword PB_API pb_sleeper(void *unused) {
     for (;;) Sleep(PB_INFINITE);
 }
 
-static __declspec(noreturn) void pb_child_idle(int with_pipe, int with_thread) {
+static __declspec(noreturn) void pb_child_idle(int with_pipe, int with_thread, int with_ballast) {
     pb_handle read_end = NULL, write_end = NULL;
     pb_dword thread_id = 0;
+    if (with_ballast) pb_ballast[0] = 1u;                 /* one byte of the megabyte */
     if (with_pipe && !CreatePipe(&read_end, &write_end, NULL, 0u)) ExitProcess(1u);
     if (with_thread && CreateThread(NULL, 0u, pb_sleeper, NULL, 0u, &thread_id) == NULL) ExitProcess(1u);
     for (;;) Sleep(PB_INFINITE);
@@ -348,8 +351,8 @@ static void pb_release(pb_handle job, pb_process *child) {
 
 /* ---- --floor ------------------------------------------------------------------------------------- */
 static int pb_floor(uint32_t repeats) {
-    static const char *const modes[3] = { "--idle", "--idle-pipe", "--idle-thread" };
-    for (uint32_t m = 0u; m < 3u; m++) {
+    static const char *const modes[4] = { "--idle", "--idle-pipe", "--idle-thread", "--idle-ballast" };
+    for (uint32_t m = 0u; m < 4u; m++) {
         for (uint32_t r = 0u; r < repeats; r++) {
             pb_handle job;
             pb_process child;
@@ -478,9 +481,10 @@ void PB_API mainCRTStartup(void) {
     if (first_len < 0) ExitProcess((unsigned int)pb_usage());
     if (second_len >= 0 && !pb_parse_u64(second, &number)) ExitProcess((unsigned int)pb_usage());
 
-    if (pb_same(first, "--idle")) pb_child_idle(0, 0);
-    if (pb_same(first, "--idle-pipe")) pb_child_idle(1, 0);
-    if (pb_same(first, "--idle-thread")) pb_child_idle(0, 1);
+    if (pb_same(first, "--idle")) pb_child_idle(0, 0, 0);
+    if (pb_same(first, "--idle-pipe")) pb_child_idle(1, 0, 0);
+    if (pb_same(first, "--idle-thread")) pb_child_idle(0, 1, 0);
+    if (pb_same(first, "--idle-ballast")) pb_child_idle(0, 0, 1);
     if (pb_same(first, "--busy")) pb_child_busy(number);
     if (pb_same(first, "--version")) { pb_write(PB_VERSION "\n"); ExitProcess(0u); }
     if (pb_same(first, "--selftest")) ExitProcess((unsigned int)pb_selftest());
