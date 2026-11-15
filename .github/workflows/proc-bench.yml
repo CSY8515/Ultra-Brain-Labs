@@ -1,0 +1,84 @@
+name: Process bench
+
+# Raw figures of one bare process on a GitHub-hosted Windows image: its private commit when idle, how long
+# TerminateJobObject takes to end it, and when a busy process last did anything after the request.
+# A measurement, not a release gate. Runs on the measurement branch and by hand.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['rc/proc-bench']
+    paths:
+      - 'src/win_proc_bench.c'
+      - '.github/workflows/proc-bench.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: ${{ matrix.compiler }} (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [clang, msvc]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (strict warnings, no C runtime, KERNEL32 only)
+        run: |
+          if ('${{ matrix.compiler }}' -eq 'clang') {
+            foreach ($name in 'win_proc_bench', 'agent_wire_ipc') {
+              $out = clang -std=c11 -O2 -Wall -Wextra -pedantic -Werror -ffreestanding -nostdlib -fuse-ld=lld '-Wl,/subsystem:console' "src/$name.c" -lkernel32 -o "$name.exe" 2>&1 | Out-String
+              if ($LASTEXITCODE -ne 0 -or $out.Trim()) { Write-Host $out; throw "clang build of $name failed or printed diagnostics" }
+            }
+            clang --version | Select-Object -First 1
+          } else {
+            $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+            foreach ($name in 'win_proc_bench', 'agent_wire_ipc') {
+              $out = cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul 2>&1 && cl /nologo /std:c11 /O2 /W4 /WX /utf-8 /GS- src\$name.c /link /SUBSYSTEM:CONSOLE /NODEFAULTLIB kernel32.lib /OUT:$name.exe" 2>&1 | Out-String
+              if ($LASTEXITCODE -ne 0 -or $out -match 'warning C\d+') { Write-Host $out; throw "MSVC build of $name failed or printed warnings" }
+            }
+          }
+          "win_proc_bench.exe: $((Get-Item win_proc_bench.exe).Length) bytes"
+
+      - name: Imports (KERNEL32.dll only)
+        run: |
+          $imports = llvm-readobj --coff-imports win_proc_bench.exe | Out-String
+          $dlls = [regex]::Matches($imports, '(?m)^\s+Name:\s*(\S+)') | ForEach-Object { $_.Groups[1].Value.ToUpper() } | Sort-Object -Unique
+          if (($dlls -join ',') -ne 'KERNEL32.DLL') { Write-Host $imports; throw "unexpected DLL dependencies: $($dlls -join ', ')" }
+          $symbols = [regex]::Matches($imports, '(?m)^\s+Symbol:\s*(\S+)') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+          "win_proc_bench.exe imports KERNEL32.dll only, $($symbols.Count) functions: $($symbols -join ', ')"
+
+      - name: Self-test
+        run: |
+          .\win_proc_bench.exe --selftest
+          if ($LASTEXITCODE -ne 0) { throw "self-test exit $LASTEXITCODE" }
+
+      - name: Measure (floor 5, kill 100, effect 100, pipe round trips 1000)
+        run: |
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $all = "compiler=${{ matrix.compiler }} run=${{ github.run_id }} sha=${{ github.sha }} cores=$([Environment]::ProcessorCount)`n"
+          foreach ($mode in @(@('--floor', '5'), @('--kill', '100'), @('--effect', '100'))) {
+            $out = & .\win_proc_bench.exe $mode[0] $mode[1] | Out-String
+            if ($LASTEXITCODE -ne 0) { Write-Host $out; throw "win_proc_bench $($mode[0]) exit $LASTEXITCODE" }
+            $all += $out
+          }
+          $all | Out-File "proc_bench_${{ matrix.compiler }}.txt" -Encoding utf8
+          Write-Host $all
+          pwsh scripts/wire_scenario.ps1 -Exe .\agent_wire_ipc.exe -Count 1000 -Out "wire_bench_${{ matrix.compiler }}.txt"
+          if ($LASTEXITCODE -ne 0) { throw "wire scenario failed" }
+          "## Process bench (${{ matrix.compiler }})`n``````text`n$all``````" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proc-bench-${{ matrix.compiler }}
+          path: |
+            proc_bench_${{ matrix.compiler }}.txt
+            wire_bench_${{ matrix.compiler }}.txt
+          if-no-files-found: error
